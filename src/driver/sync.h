@@ -85,9 +85,14 @@ constexpr double kSlewStill = 0.005, kSlewTurn = 0.0005, kSlewWalk = 0.05;
 constexpr double kJumpApply = 0.25;     // m: bigger corrections apply at once
 // levelling (Sync::LevelStep) waits this long after an acquisition, and wants the worn or held devices this close
 constexpr double kLevelSettle = 5.0, kLevelBody = 1.0;  // s, m
-// channel check (Solver::CheckIdentity): every kIdEvery s; a pair is swapped when its sightings follow each other's
-// rotor periods better by kSwapGain, and switched if the swapped alignment keeps kSwapFit of the support
-constexpr double kIdEvery = 10.0, kSwapGain = 0.10, kSwapFit = 0.7;
+// channel check (Solver::CheckIdentity): every kIdEvery s, and at the step after a new alignment. The stations are
+// mixed up when their sightings follow each other's rotor periods better than their own by kSwapGain in all; a place's
+// sightings name a rotor when they follow it by kNamed more than any other; and the alignment with the stations where
+// their rotors say is taken if it keeps kSwapFit of the support
+constexpr double kIdEvery = 10.0, kSwapGain = 0.10, kNamed = 0.05, kSwapFit = 0.7;
+// layout check (Solver::CheckLayout), three or more stations: every kLayoutEvery s. A station the cameras see kMoved
+// or more off where SteamVR's map has it beside the others is logged
+constexpr double kLayoutEvery = 30.0;
 // the lighthouse devices worn or held tell two alignments apart (Solver::BodyFavours) when one puts them within
 // kBodyNear of the head and the other kBodyGap further
 constexpr double kBodyNear = 1.0, kBodyGap = 1.0;  // m
@@ -346,12 +351,13 @@ class Solver {
   std::set<std::string> stale_;
   bool has_x_ = false, has_anchor_ = false, has_acq_x_ = false;
   X4 x_{}, anchor_{}, acq_x_{};
-  double since_ = -1e18, brk_ = -1e18, last_acq_ = -1e18, seen_ = -1e18, last_id_ = -1e18;
+  double since_ = -1e18, brk_ = -1e18, last_acq_ = -1e18, seen_ = -1e18, last_id_ = -1e18, last_layout_ = -1e18;
   std::atomic<double> frame_p_{0};
   struct CamFrame { double t, g; int cam; V3 o; M3 R; };
   std::deque<CamFrame> frames_;
   std::function<bool(int, V3)> in_image_;
   std::string id_said_;
+  std::map<std::string, double> layout_said_;  // the layout check's stations logged, and how far off
   LogFn log_;
   std::mt19937_64 rng_;
   StepStat stat_;
@@ -372,9 +378,11 @@ class Solver {
   static int Score(const std::vector<int> &c);
   static void Cells(const Rays &r, const std::vector<char> &use, std::vector<int> &cnt);
   // pivot: also fit a tilt of the stations about it (6 DOF), returned in FitR::tilt; with axis (horizontal, unit),
-  // only about that axis (5 DOF, FitR::theta too). dim_gate: the gate for rays dimmer than kBright, when narrower
+  // only about that axis (5 DOF, FitR::theta too). dim_gate: the gate for rays dimmer than kBright, when narrower.
+  // who: each ray's station as told (-1: left out), in place of the nearest within the gate
   FitR Fit(const X4 &x0, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double now, double gate,
-           const X4 *xa, const V3 *pivot = nullptr, double dim_gate = 180, const V3 *axis = nullptr);
+           const X4 *xa, const V3 *pivot = nullptr, double dim_gate = 180, const V3 *axis = nullptr,
+           const std::vector<int> *who = nullptr);
   void Hypotheses(const Rays &r, const std::vector<V3> &S, std::vector<X4> &H, int M = 4000);
   void BatchSupport(const std::vector<X4> &H, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r,
                     const std::vector<int> &idx, double gate, std::vector<int> &out) const;
@@ -390,6 +398,7 @@ class Solver {
   void CheckMirror(X4 &best, int &bs, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, const Rays &t,
                    double now);
   void CheckIdentity(double now, const std::vector<std::string> &keys, const std::vector<V3> &S, const std::vector<V3> &Z);
+  void CheckLayout(const std::vector<std::string> &keys, const std::vector<V3> &S, const std::vector<V3> &Z);
 };
 
 // ---------------------------------------------------------------- timing

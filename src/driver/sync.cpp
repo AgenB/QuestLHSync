@@ -823,6 +823,7 @@ void Solver::Reset(const X4 &x) {
   resets_++;
   anchor_ = x; has_anchor_ = true;
   id_said_.clear();
+  last_id_ = -1e18;  // a new alignment: its stations' rotors are checked at the next step
 }
 
 void Solver::Clear() {
@@ -831,7 +832,7 @@ void Solver::Clear() {
   frames_.clear();
   has_x_ = has_anchor_ = has_acq_x_ = false;
   x_ = anchor_ = acq_x_ = X4{};
-  since_ = brk_ = last_acq_ = seen_ = last_id_ = -1e18;
+  since_ = brk_ = last_acq_ = seen_ = last_id_ = last_layout_ = -1e18;
   id_said_.clear();
   stat_ = StepStat();
   has_stat_ = false;
@@ -1141,8 +1142,10 @@ static bool Solve(double A[kMaxDof][kMaxDof], const double *b, double *x, int n)
 // about the station centroid. A (head, direction) cell weighs one sighting however many it holds, so a still head adds
 // nothing by looking longer. xa: the prior's center (default x0). cond: the sightings alone pin every DOF.
 // 4 DOF; with a pivot 6: the stations also tilt about it (Tilt(y[4], y[5])), and the prior holds only the tilt.
+// who: each sighting's station as told (-1: left out), no gate.
 Solver::FitR Solver::Fit(const X4 &x0, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double now,
-                         double gate, const X4 *xa_in, const V3 *pivot, double dim_gate, const V3 *axis) {
+                         double gate, const X4 *xa_in, const V3 *pivot, double dim_gate, const V3 *axis,
+                         const std::vector<int> *who) {
   FitR out;
   std::vector<V3> P, Zq;
   Predict(x0, S, Z, P, Zq);
@@ -1151,6 +1154,12 @@ Solver::FitR Solver::Fit(const X4 &x0, const std::vector<V3> &S, const std::vect
   int m = 0;
   for (size_t n = 0; n < r.size(); n++) {
     double a;
+    if (who) {
+      if ((*who)[n] < 0) continue;
+      kk[n] = (*who)[n];
+      use[n] = 1; m++;
+      continue;
+    }
     Nearest(P, Zq, r.O[n], r.D[n], kk[n], a);
     if (a < (r.B.empty() || r.B[n] ? gate : std::min(gate, dim_gate))) { use[n] = 1; m++; }
   }
@@ -1604,15 +1613,16 @@ static double Drift(double tau, double P) {
   return std::min(f, 1 - f) / P;
 }
 
-// How much seeing a station (in the frames it was in view of, sorted by camera, time) follows the phase at each
-// period, over fake periods near it. Both on the same per-camera windows of whole turns of the slower drift. False if
-// too few frames.
-static bool SeenScores(const std::vector<InView> &s, double tau1, double tau2, double P, double &s1, double &s2) {
+// How much seeing a station (in the frames it was in view of, sorted by camera, time) follows the phase at each of
+// the periods, over fake periods near it. All on the same per-camera windows of whole turns of the slowest drift.
+// False if too few frames.
+static bool SeenScores(const std::vector<InView> &s, const std::vector<double> &tau, double P, std::vector<double> &sc) {
   const double kTurns = 2, kEps[] = {0.0015, 0.0025, 0.0035, 0.0045, 0.0055, 0.0065, 0.0075, 0.0085};
   const int kMinN = 60, kMinSeen = 20;
-  s1 = s2 = 0;
-  double rate = std::min(Drift(tau1, P), Drift(tau2, P));
-  if (!(rate > 0)) return false;
+  sc.assign(tau.size(), 0.0);
+  double rate = kInf;
+  for (double t : tau) rate = std::min(rate, Drift(t, P));
+  if (tau.empty() || !(rate > 0)) return false;
   double W = std::max(20.0, (kTurns + 1) / rate);
   struct Win { size_t a, b; double p; };  // frames [a, b), share seen
   std::vector<Win> win;
@@ -1652,8 +1662,7 @@ static bool SeenScores(const std::vector<InView> &s, double tau1, double tau2, d
     for (double e : kEps) null += R(tau * (1 + e)) + R(tau * (1 - e));
     return std::max(0.0, R(tau) - null / (2 * (sizeof kEps / sizeof kEps[0])));
   };
-  s1 = score(tau1);
-  s2 = score(tau2);
+  for (size_t i = 0; i < tau.size(); i++) sc[i] = score(tau[i]);
   return true;
 }
 
@@ -1673,8 +1682,50 @@ static X4 YawFit(const std::vector<V3> &S, const std::vector<V3> &Q) {
   return {yaw, t.x, t.y, t.z};
 }
 
-// A pair of stations whose sightings follow each other's rotor periods better than their own is swapped: switch to
-// the alignment with the two exchanged if it fits the rays about as well.
+// The columns to give the rows, each one of its own, for the largest sum of w[row][column] (rows <= columns): the
+// Hungarian method
+static std::vector<int> Assign(const std::vector<std::vector<double>> &w) {
+  int n = (int)w.size(), m = n ? (int)w[0].size() : 0;
+  std::vector<double> u(n + 1, 0.0), v(m + 1, 0.0);
+  std::vector<int> p(m + 1, 0), way(m + 1, 0);
+  for (int i = 1; i <= n; i++) {
+    p[0] = i;
+    int j0 = 0;
+    std::vector<double> minv(m + 1, kInf);
+    std::vector<char> used(m + 1, 0);
+    do {
+      used[j0] = 1;
+      int i0 = p[j0], j1 = 0;
+      double delta = kInf;
+      for (int j = 1; j <= m; j++) {
+        if (used[j]) continue;
+        double cur = -w[i0 - 1][j - 1] - u[i0] - v[j];
+        if (cur < minv[j]) { minv[j] = cur; way[j] = j0; }
+        if (minv[j] < delta) { delta = minv[j]; j1 = j; }
+      }
+      for (int j = 0; j <= m; j++) {
+        if (used[j]) { u[p[j]] += delta; v[j] -= delta; }
+        else minv[j] -= delta;
+      }
+      j0 = j1;
+    } while (p[j0]);
+    do {
+      int j1 = way[j0];
+      p[j0] = p[j1];
+      j0 = j1;
+    } while (j0);
+  }
+  std::vector<int> c(n, -1);
+  for (int j = 1; j <= m; j++)
+    if (p[j]) c[p[j] - 1] = j - 1;
+  return c;
+}
+
+// The sightings at each station's place are scored against every station's rotor period, and the stations given the
+// places whose sightings follow their rotors best (each station one place). Where that names other places than the
+// alignment's by kSwapGain in all, the stations are mixed up: two swapped, or four in a square turned by 90 deg, which
+// no swap of two puts right. The alignment with the stations at the places their rotors name is taken if it fits the
+// rays about as well and its stations follow their own rotors then.
 void Solver::CheckIdentity(double now, const std::vector<std::string> &keys, const std::vector<V3> &S,
                            const std::vector<V3> &Z) {
   double P = frame_p_;
@@ -1688,6 +1739,200 @@ void Solver::CheckIdentity(double now, const std::vector<std::string> &keys, con
     }
   }
   if (!in_image_) return;
+  std::vector<size_t> u;  // the stations with a channel of their own
+  std::vector<double> tu;
+  for (size_t k = 0; k < keys.size(); k++)
+    if (tau[k] && std::count(tau.begin(), tau.end(), tau[k]) == 1) { u.push_back(k); tu.push_back(tau[k]); }
+  if (u.size() < 2) return;
+  Rays r = Bright(GetRays(since_));
+  std::vector<CamFrame> fr;
+  {
+    std::lock_guard<std::mutex> g(m_);
+    for (auto &f : frames_)
+      if (f.t >= since_) fr.push_back(f);
+  }
+  // under an alignment: the places it puts the stations at, the ones (of u) seen enough to score, their scores for
+  // each of u's rotors, the station (of u) each one's sightings name, and how much better that naming scores in all
+  struct Id {
+    std::vector<V3> Pq, Zq;
+    std::vector<size_t> at;
+    std::vector<std::vector<double>> sc;
+    std::vector<int> is;
+    double gain = 0;
+  };
+  auto identify = [&](const X4 &x, Id &o) {
+    std::vector<V3> &Zq = o.Zq;
+    Predict(x, S, Z, o.Pq, Zq);
+    std::vector<std::set<std::pair<int, double>>> saw(keys.size());  // (camera, frame) with a sighting within 1 deg
+    for (size_t n = 0; n < r.size(); n++) {
+      if (!std::isfinite(r.G[n])) continue;
+      int k;
+      double a;
+      Nearest(o.Pq, Zq, r.O[n], r.D[n], k, a);
+      if (a < 1.0) saw[k].insert({r.C[n], r.G[n]});
+    }
+    std::vector<std::vector<InView>> in(keys.size());
+    for (auto &f : fr)
+      for (size_t k = 0; k < keys.size(); k++) {
+        V3 U = o.Pq[k] - f.o;
+        double d = norm(U);
+        if (!(dot(U, Zq[k]) >= 0.2 * d) || !in_image_(f.cam, T(f.R) * (U * (1 / d)))) continue;
+        in[k].push_back({f.cam, f.g, saw[k].count({f.cam, f.g}) > 0});
+      }
+    for (auto &v : in)
+      std::sort(v.begin(), v.end(), [](const InView &a, const InView &b) { return a.cam != b.cam ? a.cam < b.cam : a.g < b.g; });
+    o.at.clear();
+    o.sc.clear();
+    for (size_t i = 0; i < u.size(); i++) {
+      std::vector<double> sc;
+      if (!SeenScores(in[u[i]], tu, P, sc)) continue;
+      o.at.push_back(i);
+      o.sc.push_back(sc);
+    }
+    if (o.at.empty()) return false;
+    std::vector<std::vector<double>> w = o.sc;
+    for (size_t n = 0; n < w.size(); n++) w[n][o.at[n]] += 1e-9;  // a tie: its own
+    o.is = Assign(w);
+    o.gain = 0;
+    for (size_t n = 0; n < o.at.size(); n++) o.gain += o.sc[n][o.is[n]] - o.sc[n][o.at[n]];
+    return true;
+  };
+  Id cur;
+  if (!identify(x_, cur)) return;
+  auto say = [&](const std::string &key, const std::string &s) {  // once per alignment
+    if (key == id_said_) return;
+    id_said_ = key;
+    log_(s);
+  };
+  size_t N = cur.at.size();
+  std::vector<size_t> moved;
+  for (size_t n = 0; n < N; n++)
+    if (cur.is[n] != (int)cur.at[n]) moved.push_back(n);
+  if (!moved.empty() && cur.gain > kSwapGain) {
+    // the places whose sightings name a rotor by kNamed over the others. Fewer than two such: every scored place as
+    // the naming has it (of two stations swapped, one's sightings may tell and the other's not: a slow drift)
+    std::vector<char> clear(N, 0);
+    for (size_t n = 0; n < N; n++) {
+      double other = 0;
+      for (size_t i = 0; i < u.size(); i++)
+        if ((int)i != cur.is[n]) other = std::max(other, cur.sc[n][i]);
+      clear[n] = cur.sc[n][cur.is[n]] - other >= kNamed;
+    }
+    if (std::count(clear.begin(), clear.end(), 1) < 2) clear.assign(N, 1);
+    std::vector<std::pair<size_t, size_t>> pr;  // (station, the station whose place it's at), by station
+    std::vector<int> named(keys.size(), -1);    // by place: the station there
+    for (size_t n = 0; n < N; n++)
+      if (clear[n]) {
+        pr.push_back({u[cur.is[n]], u[cur.at[n]]});
+        named[u[cur.at[n]]] = (int)u[cur.is[n]];
+      }
+    std::sort(pr.begin(), pr.end());
+    std::string who, what;  // "<who> were|look <what>"
+    if (moved.size() == 2 && cur.is[moved[0]] == (int)cur.at[moved[1]] && cur.is[moved[1]] == (int)cur.at[moved[0]]) {
+      who = keys[u[cur.at[moved[0]]]] + " and " + keys[u[cur.at[moved[1]]]];
+      what = "the wrong way round";
+    } else {
+      who = "the base stations";
+      for (size_t n : moved)
+        what += (what.empty() ? "mixed up: " : ", ") + keys[u[cur.is[n]]] + " at " + keys[u[cur.at[n]]] + "'s place";
+    }
+    what += Fmt(" (by %.2f)", cur.gain);
+    auto told = [&](const char *verb) { return who + " " + verb + " " + what; };
+    if (pr.size() < 2) {
+      say("one " + who, "channel check: " + told("look") + ", but no second station was seen enough to place them by");
+      return;
+    }
+    std::vector<V3> Ss, Qs;
+    for (auto &e : pr) {
+      Ss.push_back(S[e.first]);
+      Qs.push_back(cur.Pq[e.second]);
+    }
+    // The places only start it off: the alignment put them within a degree of the stations seen there, tens of cm off
+    // in depth. Then the sightings that named the rotors, each on the station it named, and all of them at last
+    X4 xs = YawFit(Ss, Qs);
+    std::vector<int> whose(r.size(), -1);
+    for (size_t n = 0; n < r.size(); n++) {
+      int k;
+      double a;
+      Nearest(cur.Pq, cur.Zq, r.O[n], r.D[n], k, a);
+      if (a < 1.0) whose[n] = named[k];
+    }
+    for (int i = 0; i < 4; i++) {  // the fit holds on to where it starts: a few rounds
+      FitR f = Fit(xs, S, Z, r, now, 0, nullptr, nullptr, 180, nullptr, &whose);
+      if (!f.ok) break;
+      xs = f.x;
+    }
+    for (double gate : {1.5, 0.6}) {
+      FitR f = Fit(xs, S, Z, r, now, gate, nullptr);
+      if (!f.ok) break;
+      xs = f.x;
+    }
+    int sc = ThinnedScore(x_, now), sw = ThinnedScore(xs, now);
+    // the devices worn or held are the stronger evidence, and the mirror check goes by them: a switch against them
+    // would only be switched back
+    double dc, ds;
+    std::string how;
+    Id nw;
+    if (BodyFavours(x_, xs, dc, ds, how) == 1) {
+      say("body " + who, "channel check: " + told("look") + ", but " + how + ": kept as it is");
+    } else if (Apart(xs, x_, S) < 0.3) {
+      say("same " + who, "channel check: " + told("look") + ", but the rays fit no alignment that way: kept as it is");
+    } else if (!(sc > 0 && sw >= kSwapFit * sc)) {
+      say("kept " + who, "channel check: " + told("look") +
+                              Fmt(", but the rays fit that way worse (support %d vs %d): kept as it is", sw, sc));
+    } else if (identify(xs, nw) && nw.gain > kSwapGain) {
+      say("still " + who, "channel check: " + told("look") +
+                               ", but put that way they follow each other's rotors as well: kept as it is");
+    } else {
+      log_("channel check: " + told("were") + Fmt(": yaw %+.2f deg t [%.3f %.3f %.3f] support %d (was %d)", xs[0] * kDeg,
+                                                   xs[1], xs[2], xs[3], sw, sc));
+      Reset(xs);
+      has_acq_x_ = false;
+    }
+    return;
+  }
+  // the next best naming: one station at another's place, or two swapped
+  double alt = -kInf;
+  for (size_t n = 0; n < N; n++)
+    for (size_t i = 0; i < u.size(); i++) {
+      if (i == cur.at[n]) continue;
+      double g = cur.sc[n][i] - cur.sc[n][cur.at[n]];
+      for (size_t m = 0; m < N; m++)
+        if (cur.at[m] == i) g += cur.sc[m][cur.at[n]] - cur.sc[m][i];
+      alt = std::max(alt, g);
+    }
+  if (N >= 2 && alt < -kSwapGain) {
+    std::string who;
+    for (size_t n = 0; n < N; n++) who += (n == 0 ? "" : n + 1 == N ? " and " : ", ") + keys[u[cur.at[n]]];
+    say("ok " + who, Fmt("channel check: %s are %s (by %.2f)", who.c_str(),
+                         N == 2 ? "the right way round" : "all at their own places", -alt));
+  }
+}
+
+// SteamVR's map of its base stations against the cameras, with three or more (two are measured: Sync::PlaceStep). A
+// station in view of 200 short frames but seen at its place in under 2% of them, while two or more follow their own
+// rotors at theirs, is looked for among the bright sightings no station's place explains: where they cross (each one
+// votes for the cells it passes 0.6-7 m out, then the point nearest the rays about the best cell) and whose rotor
+// they follow. Its distances from the stations seen at their places, kMoved or more off SteamVR's: logged. Nothing
+// else changes
+void Solver::CheckLayout(const std::vector<std::string> &keys, const std::vector<V3> &S, const std::vector<V3> &Z) {
+  constexpr double kVox = 0.10, kNear = 1.0, kPar = 10.0;
+  constexpr int kView = 200, kLight = 60;
+  double P = frame_p_;
+  if (!has_x_ || !(P > 0) || keys.size() < 3 || !in_image_) return;
+  std::vector<double> tau(keys.size(), 0.0);
+  {
+    std::lock_guard<std::mutex> g(m_);
+    for (size_t k = 0; k < keys.size(); k++) {
+      auto it = ch_.find(keys[k]);
+      if (it != ch_.end()) tau[k] = RotorPeriod(it->second);
+    }
+  }
+  std::vector<size_t> u;  // the stations with a channel of their own
+  std::vector<double> tu;
+  for (size_t k = 0; k < keys.size(); k++)
+    if (tau[k] && std::count(tau.begin(), tau.end(), tau[k]) == 1) { u.push_back(k); tu.push_back(tau[k]); }
+  if (u.size() < 3) return;
   Rays r = Bright(GetRays(since_));
   std::vector<CamFrame> fr;
   {
@@ -1697,70 +1942,148 @@ void Solver::CheckIdentity(double now, const std::vector<std::string> &keys, con
   }
   std::vector<V3> Pq, Zq;
   Predict(x_, S, Z, Pq, Zq);
-  std::vector<std::set<std::pair<int, double>>> saw(keys.size());  // (camera, frame) with a sighting within 1 deg
+  std::vector<int> at(r.size(), -1);  // the station whose place a sighting is within kNear deg of; -2: none within GATE
   for (size_t n = 0; n < r.size(); n++) {
     if (!std::isfinite(r.G[n])) continue;
     int k;
     double a;
     Nearest(Pq, Zq, r.O[n], r.D[n], k, a);
-    if (a < 1.0) saw[k].insert({r.C[n], r.G[n]});
+    if (a < kNear) at[n] = k;
+    else if (!(a < GATE)) at[n] = -2;
   }
-  std::vector<std::vector<InView>> in(keys.size());
-  for (auto &f : fr)
-    for (size_t k = 0; k < keys.size(); k++) {
-      V3 U = Pq[k] - f.o;
+  // the short frames a place was in view of (facing z, if given), and which of them saw it
+  auto view = [&](V3 q, const V3 *z, const std::set<std::pair<int, double>> &saw) {
+    std::vector<InView> v;
+    for (auto &f : fr) {
+      V3 U = q - f.o;
       double d = norm(U);
-      if (!(dot(U, Zq[k]) >= 0.2 * d) || !in_image_(f.cam, T(f.R) * (U * (1 / d)))) continue;
-      in[k].push_back({f.cam, f.g, saw[k].count({f.cam, f.g}) > 0});
+      if ((z && !(dot(U, *z) >= 0.2 * d)) || !in_image_(f.cam, T(f.R) * (U * (1 / d)))) continue;
+      v.push_back({f.cam, f.g, saw.count({f.cam, f.g}) > 0});
     }
-  for (auto &v : in)
     std::sort(v.begin(), v.end(), [](const InView &a, const InView &b) { return a.cam != b.cam ? a.cam < b.cam : a.g < b.g; });
-  double worst = 0, best = 0;
-  size_t wa = 0, wb = 0, ba = 0, bb = 0;
-  for (size_t a = 0; a < keys.size(); a++)
-    for (size_t b = a + 1; b < keys.size(); b++) {
-      if (!tau[a] || !tau[b] || tau[a] == tau[b]) continue;
-      double aa, ab, bb_, ba_;
-      if (!SeenScores(in[a], tau[a], tau[b], P, aa, ab) || !SeenScores(in[b], tau[b], tau[a], P, bb_, ba_)) continue;
-      double gain = ab + ba_ - aa - bb_;
-      if (gain > worst) { worst = gain; wa = a; wb = b; }
-      if (gain < best) { best = gain; ba = a; bb = b; }
-    }
-  auto say = [&](const std::string &key, const std::string &s) {  // once per alignment
-    if (key == id_said_) return;
-    id_said_ = key;
-    log_(s);
+    return v;
   };
-  if (worst > kSwapGain) {
-    std::vector<V3> Q = Pq;
-    std::swap(Q[wa], Q[wb]);
-    X4 xs = YawFit(S, Q);
-    for (double gate : {1.5, 0.6}) {
-      FitR f = Fit(xs, S, Z, r, now, gate, nullptr);
-      if (!f.ok) break;
-      xs = f.x;
+  auto named = [&](const std::vector<double> &sc) {  // the rotor (of u) followed by kNamed over the others, or -1
+    int b = (int)(std::max_element(sc.begin(), sc.end()) - sc.begin());
+    double other = 0;
+    for (size_t i = 0; i < sc.size(); i++)
+      if ((int)i != b) other = std::max(other, sc[i]);
+    return sc[b] - other >= kNamed ? b : -1;
+  };
+  std::vector<std::set<std::pair<int, double>>> saw(keys.size());
+  for (size_t n = 0; n < r.size(); n++)
+    if (at[n] >= 0) saw[at[n]].insert({r.C[n], r.G[n]});
+  std::vector<size_t> ok, gone;  // of u: seen at their places, following their own rotors; in view there, unseen
+  for (size_t i = 0; i < u.size(); i++) {
+    std::vector<InView> v = view(Pq[u[i]], &Zq[u[i]], saw[u[i]]);
+    int seen = 0;
+    for (auto &e : v) seen += e.seen;
+    std::vector<double> sc;
+    if ((int)v.size() >= kView && seen * 50 <= (int)v.size()) gone.push_back(i);
+    else if (SeenScores(v, tu, P, sc) && named(sc) == (int)i) ok.push_back(i);
+  }
+  if (ok.size() < 2 || gone.empty()) return;
+  std::vector<size_t> fn, vn;  // the sightings no place explains; one of them per (head, direction) cell votes
+  {
+    std::unordered_map<CellKey, int, CellHash> cells;
+    for (size_t n = 0; n < r.size(); n++)
+      if (at[n] == -2) {
+        fn.push_back(n);
+        if (cells.emplace(KeyOf(r.O[n], r.D[n]), 0).second) vn.push_back(n);
+      }
+  }
+  if ((int)fn.size() < kLight) return;
+  auto off = [&](V3 q, size_t n) {  // deg
+    V3 w = q - r.O[n];
+    double d = norm(w);
+    return d > 0.4 ? std::acos(std::max(-1.0, std::min(1.0, dot(w, r.D[n]) / d))) * kDeg : kInf;
+  };
+  const int64_t kO = 1 << 20;  // cells: 21 bits a coordinate
+  std::vector<char> left(r.size(), 0);
+  for (size_t n : fn) left[n] = 1;
+  for (int it = 0; it < 6; it++) {
+    std::unordered_map<int64_t, int> vote;
+    for (size_t n : vn) {
+      if (!left[n]) continue;
+      int64_t last = -1;
+      for (double d = 0.6; d < 7.0; d += kVox / 2) {
+        V3 p = r.O[n] + r.D[n] * d;
+        int64_t c = ((int64_t)std::floor(p.x / kVox) + kO) << 42 | ((int64_t)std::floor(p.y / kVox) + kO) << 21 |
+                    ((int64_t)std::floor(p.z / kVox) + kO);
+        if (c != last) vote[c]++;
+        last = c;
+      }
     }
-    int cur = ThinnedScore(x_, now), sw = ThinnedScore(xs, now);
-    std::string pair = keys[wa] + " and " + keys[wb];
-    // the devices worn or held are the stronger evidence, and the mirror check goes by them: a switch against them
-    // would only be switched back
-    double dc, ds;
-    std::string how;
-    if (BodyFavours(x_, xs, dc, ds, how) == 1) {
-      say("body " + pair, Fmt("channel check: %s look the wrong way round (by %.2f), but %s: kept as it is",
-                              pair.c_str(), worst, how.c_str()));
-    } else if (cur > 0 && sw >= kSwapFit * cur) {
-      log_(Fmt("channel check: %s were the wrong way round (by %.2f): yaw %+.2f deg t [%.3f %.3f %.3f] support %d (was %d)",
-               pair.c_str(), worst, xs[0] * kDeg, xs[1], xs[2], xs[3], sw, cur));
-      Reset(xs);
-      has_acq_x_ = false;
-    } else {
-      say("kept " + pair, Fmt("channel check: %s look the wrong way round (by %.2f), but the rays fit that way worse "
-                              "(support %d vs %d): kept as it is", pair.c_str(), worst, sw, cur));
+    int64_t best = -1;
+    int bv = 0;
+    for (auto &kv : vote)
+      if (kv.second > bv || (kv.second == bv && kv.first < best)) { best = kv.first; bv = kv.second; }
+    if (bv < 10) break;
+    V3 q{((best >> 42) - kO + 0.5) * kVox, (((best >> 21) & 0x1FFFFF) - kO + 0.5) * kVox, ((best & 0x1FFFFF) - kO + 0.5) * kVox};
+    std::vector<size_t> near;
+    for (int rep = 0; rep < 6; rep++) {
+      near.clear();
+      for (size_t n : fn)
+        if (left[n] && off(q, n) < (rep < 3 ? 2.0 : 0.7)) near.push_back(n);
+      if (near.size() < 10) break;
+      M3 A;
+      A.m[0][0] = A.m[1][1] = A.m[2][2] = 0;
+      double bq[3] = {0, 0, 0};
+      for (size_t n : near) {
+        double dv[3] = {r.D[n].x, r.D[n].y, r.D[n].z}, ov[3] = {r.O[n].x, r.O[n].y, r.O[n].z};
+        for (int i = 0; i < 3; i++)
+          for (int j = 0; j < 3; j++) {
+            double pij = (i == j ? 1 : 0) - dv[i] * dv[j];
+            A.m[i][j] += pij;
+            bq[i] += pij * ov[j];
+          }
+      }
+      M3 Ai;
+      if (!Inv3(A, Ai)) { near.clear(); break; }
+      q = Ai * V3{bq[0], bq[1], bq[2]};
     }
-  } else if (best < -kSwapGain) {
-    say("ok " + keys[ba] + keys[bb], Fmt("channel check: %s are the right way round (by %.2f)",
-                                         (keys[ba] + " and " + keys[bb]).c_str(), -best));
+    for (size_t n : fn)
+      if (left[n] && off(q, n) < 2.0) left[n] = 0;
+    if ((int)near.size() < kLight) continue;
+    // seen from directions kPar apart or more: its depth is known
+    V3 m{};
+    std::vector<V3> w;
+    for (size_t n : near) {
+      V3 e = r.O[n] - q;
+      w.push_back(e * (1 / norm(e)));
+      m += w.back();
+    }
+    m = m * (1 / norm(m));
+    std::vector<double> pa;
+    for (auto &e : w) pa.push_back(std::acos(std::max(-1.0, std::min(1.0, dot(e, m)))) * kDeg);
+    std::sort(pa.begin(), pa.end());
+    double par = pa[pa.size() * 9 / 10];
+    std::set<std::pair<int, double>> sq;
+    for (size_t n : fn)
+      if (off(q, n) < kNear) sq.insert({r.C[n], r.G[n]});
+    std::vector<double> sc;
+    bool scored = SeenScores(view(q, nullptr, sq), tu, P, sc);
+    int i = scored ? named(sc) : -1;
+    if (i < 0 || par < kPar || std::find(gone.begin(), gone.end(), (size_t)i) == gone.end()) continue;
+    size_t k = u[i];
+    double worst = 0, moved = norm(q - Pq[k]);
+    std::string js, ds, dc;
+    for (size_t j = 0; j < ok.size(); j++) {
+      size_t kj = u[ok[j]];
+      double a = norm(S[k] - S[kj]), b = norm(q - Pq[kj]);
+      worst = std::max(worst, std::fabs(b - a));
+      const char *sep = j == 0 ? "" : j + 1 == ok.size() ? " and " : ", ";
+      js += sep + keys[kj];
+      ds += sep + Fmt("%.2f", a);
+      dc += sep + Fmt("%.2f", b);
+    }
+    if (worst < kMoved) continue;
+    auto said = layout_said_.find(keys[k]);
+    if (said != layout_said_.end() && std::fabs(said->second - moved) < kMoved) continue;
+    layout_said_[keys[k]] = moved;
+    log_("base station layout: SteamVR has " + keys[k] + " " + ds + " m from " + js + "; the cameras see it " + dc +
+         " m from them" + Fmt(" (%.2f m from where SteamVR has it)", moved) +
+         ": SteamVR's map of its base stations is off");
   }
 }
 
@@ -1830,6 +2153,10 @@ StepStat Solver::Step(double /*now*/) {
   if (has_x_ && now - last_id_ >= kIdEvery) {
     last_id_ = now;
     CheckIdentity(now, keys, S, Z);
+  }
+  if (has_x_ && now - last_layout_ >= kLayoutEvery) {
+    last_layout_ = now;
+    CheckLayout(keys, S, Z);
   }
   bool locked = false;
   if (has_x_ && st.has_per) {
