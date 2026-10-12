@@ -3304,7 +3304,7 @@ void Sync::LevelCheck(double now) {
 }
 
 // two stations have 10 sightings that fit
-static bool Locked(bool has_x, const StepStat &st) {
+static bool TwoFit(bool has_x, const StepStat &st) {
   if (!has_x || !st.has_per) return false;
   std::vector<int> c;
   for (auto &kv : st.per) c.push_back(kv.second);
@@ -3316,9 +3316,11 @@ Transform Sync::Tick(double now) {
   ApplyHeadset();
   if (now - last_step_ >= 1.0) {
     last_step_ = now;
+    bool broke = false;
     int b = poses_.brk_id();
     if (b != brk_seen_) {
       brk_seen_ = b;
+      broke = true;
       solver_.PoseBreak(poses_.brk_t());
       log_("HMD pose break (" + poses_.brk_what() + "): older sightings dropped, acquiring");
     }
@@ -3419,14 +3421,23 @@ Transform Sync::Tick(double now) {
       }
     }
     StepStat st = solver_.Step(now);
-    if (solver_.resets() != resets_seen_) { resets_seen_ = solver_.resets(); lock_time_ = now; }
+    bool reset = solver_.resets() != resets_seen_;
+    if (reset) { resets_seen_ = solver_.resets(); lock_time_ = now; }
+    // locked: two stations have 10 sightings that fit. It holds while one still has: a station out of view for WIN
+    // is no misfit. A pose break, a jump in the Quest's tracking or a new fit ends it
+    {
+      int best = 0;
+      for (auto &kv : st.per) best = std::max(best, kv.second);
+      locked_ = TwoFit(solver_.has_x(), st) ||
+                (locked_ && !broke && !reset && !st.jump && solver_.has_x() && st.has_per && best >= 10);
+    }
     {
       std::lock_guard<std::mutex> g(st_m_);
       last_st_ = st;
       has_last_st_ = true;
     }
     // not acquired: what became of the cameras' bright spots, after a minute and then every 5
-    if (Locked(solver_.has_x(), st)) sum_t_ = -1;
+    if (locked_) sum_t_ = -1;
     else {
       Spots sp = spots();
       if (sum_t_ < 0) { sum_t_ = now; sum_sp_ = sp; sum_n_ = 0; }
@@ -3444,7 +3455,7 @@ Transform Sync::Tick(double now) {
           solver_.has_x() ? Fmt("%+.4f %.4f %.4f %.4f", x[0] * kDeg, x[1], x[2], x[3]).c_str() : "-", st.n,
           st.has_med ? Fmt("%.4f", st.med).c_str() : "None", per.c_str(), st.cond ? " cond" : "", st.jump ? " JUMP" : "");
     }
-    if (Locked(solver_.has_x(), st) && st.cond && st.has_med && st.med < 0.3 && now - last_save_ > 10) {
+    if (TwoFit(solver_.has_x(), st) && st.cond && st.has_med && st.med < 0.3 && now - last_save_ > 10) {
       last_save_ = now;
       SaveState(x, cs);
     }
@@ -3503,11 +3514,11 @@ Transform Sync::Tick(double now) {
       last_level_ = now;
       LevelStep(raw, now);
     }
-    if (now - last_place_ >= kPlaceEvery && Locked(solver_.has_x(), st) && st.cond) {
+    if (now - last_place_ >= kPlaceEvery && TwoFit(solver_.has_x(), st) && st.cond) {
       last_place_ = now;
       PlaceStep(raw, now);
     }
-    if (now - last_check_ >= 60 && Locked(solver_.has_x(), st) && st.cond) {
+    if (now - last_check_ >= 60 && TwoFit(solver_.has_x(), st) && st.cond) {
       last_check_ = now;
       LevelCheck(now);
     }
@@ -3597,7 +3608,7 @@ Sync::Status Sync::GetStatus(double now) {
   s.cond = st.cond;
   s.n = st.n;
   s.med = st.has_med ? st.med : -1;
-  s.locked = Locked(s.has_x, st);
+  s.locked = s.has_x && locked_;
   s.locked_for = lock_time_ >= 0 ? now - lock_time_ : -1;
   if (s.has_x && have_applied_) {
     V3 h{0, 1.5, 0};

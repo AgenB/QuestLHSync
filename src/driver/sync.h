@@ -512,7 +512,7 @@ class Sync {
   std::map<std::string, std::pair<V3, M3>> raw_;
   std::map<std::string, int> channels_;
   std::map<std::string, V3> quest_;  // saved station positions in Quest space
-  bool seeded_ = false, have_applied_ = false, paused_ = false;
+  bool seeded_ = false, have_applied_ = false, paused_ = false, locked_ = false;
   X4 applied_{};
   double last_step_ = 0, last_save_ = 0, last_s_ = 0, last_timing_ = 0, last_level_ = 0, lock_time_ = -1;
   double split_said_ = -1e18;  // when a timing estimate too unsure to take was last logged
