@@ -12,7 +12,7 @@
 #define QLHS_SHM_FILE "status.shm"
 #define QLHS_OVERLAY_LOCK "overlay.lock"
 #define QLHS_VERSION 2
-#define QLHS_RELEASE "1.18"  // magisk/build_module.py reads it
+#define QLHS_RELEASE "1.23"  // magisk/build_module.py reads it
 
 enum QlhsState : int32_t {
   QLHS_STARTING = 0,
@@ -34,6 +34,7 @@ enum QlhsCmd : int32_t {
   QLHS_CMD_RESUME = 3,
   QLHS_CMD_RECORD_ON = 4,
   QLHS_CMD_RECORD_OFF = 5,
+  QLHS_CMD_RECALIBRATE = 6,  // drop every learned and saved alignment of this headset and start over
 };
 
 #pragma pack(push, 8)

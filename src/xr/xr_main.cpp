@@ -500,6 +500,7 @@ static void Engine(const Options &o) {
 
   SyncConfig cfg;
   cfg.dir = dir;
+  cfg.per_headset = true;  // state.json per headset, as the driver
   Sync sync(cfg, [](const std::string &s) { Log(s); });
   HeadsetLink link(&sync, [](const std::string &s) { Log(s); }, [&](double t, const std::string &s) { sync.Rec(t, "%s", s.c_str()); });
   link.SetMemory(dir + "/headset.txt");
@@ -633,6 +634,7 @@ static void Engine(const Options &o) {
         case QLHS_CMD_RESUME: paused_ = false; sync.SetPaused(false); note("corrections resumed"); break;
         case QLHS_CMD_RECORD_ON: set_recording(true); break;
         case QLHS_CMD_RECORD_OFF: set_recording(false); break;
+        case QLHS_CMD_RECALIBRATE: sync.ForceRecalibrate(); note("recalibrating: everything learned about the alignment is dropped"); break;
       }
     }
     if (!xr.ses) {
