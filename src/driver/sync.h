@@ -85,6 +85,14 @@ constexpr double kSlewStill = 0.005, kSlewTurn = 0.0005, kSlewWalk = 0.05;
 constexpr double kJumpApply = 0.25;     // m: bigger corrections apply at once
 // levelling (Sync::LevelStep) waits this long after an acquisition, and wants the worn or held devices this close
 constexpr double kLevelSettle = 5.0, kLevelBody = 1.0;  // s, m
+// the level is a constant (SteamVR's frame as it was first seen, against the headset's gravity), read off five
+// minutes of sightings at a time: a reading every kLevelEvery s, the level the mean of the last kLevelMemory (looked
+// at every 10 s for kLevelJump)
+constexpr double kLevelEvery = 60.0;
+constexpr int kLevelMemory = 60;
+// unless SteamVR re-solves its base stations under the frame and the level moves with them: a reading this far (deg)
+// from the mean is no scatter, and the mean starts over from it
+constexpr double kLevelJump = 0.6;
 // channel check (Solver::CheckIdentity): every kIdEvery s, and at the step after a new alignment. The stations are
 // mixed up when their sightings follow each other's rotor periods better than their own by kSwapGain in all; a place's
 // sightings name a rotor when they follow it by kNamed more than any other; and the alignment with the stations where
@@ -209,6 +217,7 @@ struct StationsFile {
   V3 anchor_p;
   M3 anchor_R;
   M3 level;  // automatic frames: turns the frame level with the headset's gravity (Solver::Level)
+  int level_n = 0;  // how many of the cameras' readings the level is the mean of (Sync::LevelStep)
   std::map<std::string, V3> fix;  // measured positions, reference frame
   // automatic frames of three or more stations: each one's pose in the reference frame, before the level
   std::map<std::string, std::pair<V3, M3>> ref;
@@ -515,6 +524,7 @@ class Sync {
   bool seeded_ = false, have_applied_ = false, paused_ = false, locked_ = false;
   X4 applied_{};
   double last_step_ = 0, last_save_ = 0, last_s_ = 0, last_timing_ = 0, last_level_ = 0, lock_time_ = -1;
+  double level_read_ = -1e9;  // the last reading LevelStep took
   double split_said_ = -1e18;  // when a timing estimate too unsure to take was last logged
   int brk_seen_ = 0, resets_seen_ = 0;
   double last_prec_ = -1e18;
