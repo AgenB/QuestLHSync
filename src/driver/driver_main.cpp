@@ -3,8 +3,8 @@
 // flashes seen by the tracking cameras; this driver solves the 4-DOF lighthouse -> headset transform (sync.cpp) and
 // applies it to every lighthouse-tracked device (trackers, controllers, base stations).
 //
-// Hooks IVRServerDriverHost::TrackedDevicePoseUpdated (MinHook on the function, so every driver's calls go
-// through it): lighthouse devices get the transform prepended to their WorldFromDriver, and the HMD's own poses
+// Hooks IVRServerDriverHost::TrackedDevicePoseUpdated (MinHook on the function on Windows, so every driver's calls go
+// through it; the interface's vtable slot on Linux): lighthouse devices get the transform prepended to their WorldFromDriver, and the HMD's own poses
 // (any streamer's) feed the solver with their exact times. Status and commands for the dashboard overlay
 // (QuestLHSync.exe, launched from here) go through the shared memory in qlhs_status.h.
 #ifdef _WIN32
@@ -15,6 +15,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <spawn.h>
+#include <unistd.h>
 #include <sys/mman.h>
 #endif
 
@@ -241,6 +242,7 @@ static void Detour(void *self, uint32_t id, const vr::DriverPose_t &pose, uint32
   g_orig[I](self, id, pose, size);
 }
 
+#ifdef _WIN32
 static void HookHost(const char *version, int i, void *detour) {
   vr::EVRInitError err = vr::VRInitError_None;
   void *host = vr::VRDriverContext()->GetGenericInterface(version, &err);
@@ -256,7 +258,74 @@ static void HookHost(const char *version, int i, void *detour) {
   g_detour[i] = detour;
   Log(Fmt("hooked %s::TrackedDevicePoseUpdated", version));
 }
+#else
+// Linux: the host's vtable slot is swapped instead of the function's code being patched, as vrserver's own build of the
+// function is often one the inline hook can't copy (rip-relative or too short a prologue). The slot is the interface's
+// own, so only calls through this interface version are seen.
+static void **g_slot[2];
 
+// makes the page holding p writable, then restores the protection it had (read from /proc/self/maps)
+static bool WriteSlot(void **p, void *v) {
+  long ps = sysconf(_SC_PAGESIZE);
+  uintptr_t a = (uintptr_t)p, page = a & ~(uintptr_t)(ps - 1);
+  int orig = PROT_READ;
+  if (FILE *f = fopen("/proc/self/maps", "r")) {
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+      unsigned long lo, hi;
+      char perms[8];
+      if (sscanf(line, "%lx-%lx %7s", &lo, &hi, perms) == 3 && a >= lo && a < hi) {
+        orig = (perms[0] == 'r' ? PROT_READ : 0) | (perms[1] == 'w' ? PROT_WRITE : 0) | (perms[2] == 'x' ? PROT_EXEC : 0);
+        break;
+      }
+    }
+    fclose(f);
+  }
+  if (mprotect((void *)page, ps, orig | PROT_WRITE) != 0) return false;
+  __atomic_store_n(p, v, __ATOMIC_RELEASE);
+  if (!(orig & PROT_WRITE)) mprotect((void *)page, ps, orig);
+  return true;
+}
+
+static void HookHost(const char *version, int i, void *detour) {
+  vr::EVRInitError err = vr::VRInitError_None;
+  void *host = vr::VRDriverContext()->GetGenericInterface(version, &err);
+  if (!host) { Log(Fmt("no %s", version)); return; }
+  void **slot = &(*(void ***)host)[1];
+  for (int j = 0; j < 2; j++)
+    if (g_slot[j] == slot || (g_target[j] && g_target[j] == *slot)) {
+      Log(Fmt("%s shares the hooked function", version));
+      return;
+    }
+  void *fn = *slot;
+  if (!WriteSlot(slot, detour)) {
+    Log(Fmt("hooking %s failed", version));
+    return;
+  }
+  g_orig[i] = (PoseFn)fn;
+  g_slot[i] = slot;
+  g_target[i] = fn;
+  g_detour[i] = detour;
+  Log(Fmt("hooked %s::TrackedDevicePoseUpdated (vtable)", version));
+}
+
+// puts the original function back in each slot still holding our detour; one another driver has patched since stays,
+// passing poses on untouched, as restoring ours would take theirs out with it
+static void UnhookHost() {
+  for (int j = 0; j < 2; j++) {
+    if (!g_slot[j]) continue;
+    if (*g_slot[j] == g_detour[j] && WriteSlot(g_slot[j], (void *)g_orig[j])) {
+      Log("pose hook taken out");
+      g_slot[j] = nullptr;
+      g_target[j] = nullptr;
+    } else if (*g_slot[j] != g_detour[j]) {
+      Log("another driver hooked SteamVR's pose updates after QuestLHSync: its hook stays, passing poses on untouched");
+    }
+  }
+}
+#endif
+
+#ifdef _WIN32
 // takes the pose hooks out, each only while its function still jumps straight to our detour (MinHook's jmp to a relay
 // holding the detour's address): one another driver has hooked over since stays, passing poses on untouched, as taking
 // it out would take theirs with it
@@ -274,6 +343,8 @@ static void UnhookHost() {
     }
   }
 }
+
+#endif
 
 // ---------------------------------------------------------------- status shared memory
 static std::mutex g_stlog_m;
@@ -375,8 +446,12 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     if (worker_.joinable()) worker_.join();
     if (g_gravity) g_gravity->Stop();
     if (link_) link_->Stop();
+#ifdef _WIN32
     for (int j = 0; j < 2; j++)
       if (g_target[j]) MH_DisableHook(g_target[j]);
+#else
+    UnhookHost();
+#endif
     if (g_rel) { g_rel->Unhook(); g_rel->Flush(true); }
     MH_Uninitialize();
     if (g_sync) g_sync->SetRecord(nullptr);
